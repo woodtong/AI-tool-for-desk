@@ -7,6 +7,7 @@
 - 流式输出显示
 - 对话历史记录（上下文）
 """
+import logging
 import markdown
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QTextBrowser,
@@ -19,7 +20,9 @@ from PySide6.QtGui import (
     QPixmap, QIcon, QCursor
 )
 from src.ai_providers.adapter import AIAdapter
-from src.knowledge_base import load_knowledge_base
+from src.knowledge_base import load_knowledge_base, invalidate_cache
+
+logger = logging.getLogger(__name__)
 
 
 # ==================== AI 响应工作线程 ====================
@@ -246,6 +249,8 @@ class ChatWindow(QWidget):
     MIN_HEIGHT = 300
     # 低于此宽度时隐藏模型名称标签
     MODEL_LABEL_HIDE_WIDTH = 340
+    # 最大保留历史对话对数（超出丢弃最早的）
+    MAX_HISTORY_PAIRS = 10
 
     def __init__(self, provider_manager, config_manager, parent=None):
         super().__init__(parent)
@@ -261,6 +266,12 @@ class ChatWindow(QWidget):
         self._current_stream_bubble = None
         # 当前累积的 AI 回复文本
         self._current_response = ""
+
+        # 流式渲染节流：50ms 内多次 chunk 只渲染一次
+        self._render_pending = False
+        self._render_timer = QTimer(self)
+        self._render_timer.setSingleShot(True)
+        self._render_timer.timeout.connect(self._flush_render)
 
         self._setup_ui()
         self._load_config()
@@ -313,6 +324,14 @@ class ChatWindow(QWidget):
         self.model_label.setMinimumWidth(0)
         self.model_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         ctrl_layout.addWidget(self.model_label)
+
+        # 清空上下文按钮
+        self.clear_btn = QPushButton("🗑 清空上下文")
+        self.clear_btn.setObjectName("clearCtxBtn")
+        self.clear_btn.setFixedHeight(22)
+        self.clear_btn.setCursor(Qt.PointingHandCursor)
+        self.clear_btn.clicked.connect(self._on_clear_context)
+        ctrl_layout.addWidget(self.clear_btn)
 
         main_layout.addWidget(control_bar)
 
@@ -452,26 +471,72 @@ class ChatWindow(QWidget):
         self.send_btn.setText("回复中...")
 
     def _on_ai_chunk(self, chunk):
-        """收到 AI 回复片段"""
+        """收到 AI 回复片段（使用节流机制，避免高频渲染）"""
         self._current_response += chunk
+        if self._current_stream_bubble and not self._render_pending:
+            self._render_pending = True
+            self._render_timer.start(50)  # 50ms 内合并多次更新
+
+    def _flush_render(self):
+        """执行实际的渲染更新（节流定时器到期）"""
+        self._render_pending = False
         if self._current_stream_bubble:
             self._current_stream_bubble.update_content(self._current_response)
             self._scroll_to_bottom()
 
     def _on_ai_finished(self):
         """AI 回复完成"""
+        # 强制刷新最后一次渲染
+        self._render_timer.stop()
+        self._flush_render()
         if self._current_stream_bubble:
             self._current_stream_bubble.set_streaming(False)
         self._history.append({"role": "assistant", "content": self._current_response})
+        self._enforce_history_cap()
         self._cleanup_worker()
+
+    def _on_clear_context(self):
+        """清空对话历史和上下文"""
+        self._history.clear()
+        # 清除消息区域中除欢迎消息外的所有气泡
+        while self.msg_layout.count() > 1:
+            item = self.msg_layout.takeAt(1)
+            if item and item.widget():
+                item.widget().deleteLater()
+        # 重新添加欢迎消息（如果已不在则跳过）
+        if self.msg_layout.count() == 0:
+            self._add_welcome_message()
+        # 清空输入框
+        self.input_edit.clear()
+        # 使知识库缓存失效（下次发送时重新加载）
+        invalidate_cache()
+        logger.info("对话上下文已清空")
 
     def _on_ai_error(self, error_msg):
         """AI 回复出错"""
+        self._render_timer.stop()
+        self._render_pending = False
         err_text = f"\n\n**请求出错**: {error_msg}"
         if self._current_stream_bubble:
             self._current_stream_bubble.update_content(self._current_response + err_text)
             self._current_stream_bubble.set_streaming(False)
         self._cleanup_worker()
+
+    def _enforce_history_cap(self):
+        """限制历史对话长度，超出时丢弃最早的对话对"""
+        while len(self._history) > self.MAX_HISTORY_PAIRS * 2:
+            # 丢弃最早的一对 (user, assistant) 消息
+            removed = 0
+            for i, msg in enumerate(self._history):
+                if msg["role"] == "user":
+                    # 移除这条 user 消息和下一条 assistant 消息
+                    self._history.pop(i)
+                    if i < len(self._history) and self._history[i]["role"] == "assistant":
+                        self._history.pop(i)
+                    removed = 2
+                    break
+            if removed == 0:
+                break  # 防止无限循环
 
     def _build_knowledge_context(self):
         """加载知识库内容，追加到系统提示词末尾"""
@@ -774,6 +839,19 @@ class ChatWindow(QWidget):
                 background-color: #555;
                 color: #888;
             }
+            QPushButton#clearCtxBtn {
+                background-color: transparent;
+                color: #888;
+                border: 1px solid #555;
+                border-radius: 3px;
+                font-size: 11px;
+                padding: 0 8px;
+            }
+            QPushButton#clearCtxBtn:hover {
+                background-color: #444;
+                color: #e0e0e0;
+                border-color: #888;
+            }
             QSlider::groove:horizontal {
                 height: 4px;
                 background: #555;
@@ -845,6 +923,8 @@ class ChatWindow(QWidget):
 
     def closeEvent(self, event):
         """关闭事件 - 隐藏到系统托盘而非退出"""
+        # 隐藏时刷入待保存的配置（位置、大小等）
+        self._config.flush()
         event.ignore()
         self.hide()
         self.window_hidden.emit()

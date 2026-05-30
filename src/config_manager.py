@@ -82,13 +82,17 @@ def _deep_merge(default, override):
 
 
 class ConfigManager:
-    """配置管理器，提供配置的读取、写入、修改功能"""
+    """配置管理器，提供配置的读取、写入、修改功能
+
+    优化: set() 仅标记脏，save() 延迟写入，避免高频操作（拖拽窗口等）反复写盘
+    """
 
     def __init__(self, config_path=None):
         if config_path is None:
             config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
         self.config_path = config_path
         self.config = self._load()
+        self._dirty = False  # 脏标记：是否有未写入的修改
 
     def _load(self):
         """从文件加载配置，与 DEFAULT_CONFIG 深层合并后返回"""
@@ -134,17 +138,28 @@ class ConfigManager:
                 return default
         return value
 
-    def set(self, key, value):
+    def set(self, key, value, immediate=False):
         """
         设置配置项，支持点号路径语法
         示例: set("providers.openai.api_key", "sk-xxx")
+
+        参数:
+            immediate: bool - 是否立即写盘（默认 False，仅在退出等关键场景使用）
         """
         keys = key.split(".")
         target = self.config
         for k in keys[:-1]:
             target = target.setdefault(k, {})
         target[keys[-1]] = value
-        self.save()
+        self._dirty = True
+        if immediate:
+            self.flush()
+
+    def flush(self):
+        """将内存中的脏配置写入磁盘（仅在存在未保存修改时执行）"""
+        if self._dirty:
+            self.save()
+            self._dirty = False
 
     def get_providers(self):
         """获取启用的 AI 提供者列表"""
@@ -162,7 +177,8 @@ class ConfigManager:
         for p in self.config.get("providers", []):
             if p["id"] == provider_id:
                 p.update(updates)
-                self.save()
+                self._dirty = True
+                self.flush()  # 设置界面保存需要立即写盘
                 return True
         return False
 
@@ -198,4 +214,4 @@ class ConfigManager:
 
     def mark_first_run_done(self):
         """标记首次运行已完成"""
-        self.set("first_run", False)
+        self.set("first_run", False, immediate=True)

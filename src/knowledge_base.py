@@ -71,9 +71,42 @@ def _read_file(filepath):
         return None
 
 
+# ====== 进程级缓存 ======
+_cache_content = ""
+_cache_valid = False
+_cache_key = ""  # 用于判断文件是否有变化的标记
+
+
+def _compute_cache_key(kb_path):
+    """计算缓存键：目录下所有支持文件路径 + 修改时间的哈希"""
+    key_parts = []
+    for root, dirs, files in os.walk(kb_path):
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        for fname in sorted(files):
+            if _should_skip(fname):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in SUPPORTED_EXTENSIONS:
+                continue
+            filepath = os.path.join(root, fname)
+            try:
+                mtime = os.path.getmtime(filepath)
+                key_parts.append(f"{filepath}:{mtime}")
+            except OSError:
+                pass
+    return "|".join(key_parts)
+
+
+def invalidate_cache():
+    """使知识库缓存失效（设置界面修改知识库路径时调用）"""
+    global _cache_valid
+    _cache_valid = False
+
+
 def load_knowledge_base(kb_path=None):
     """
     扫描知识库文件夹，读取所有支持的文件内容
+    带有进程级缓存：文件未变化时直接返回上次加载结果
 
     参数:
         kb_path: str - 知识库文件夹路径，默认为项目根目录下的 knowledge_base
@@ -81,21 +114,34 @@ def load_knowledge_base(kb_path=None):
     返回:
         str - 格式化后的知识库文本内容，如果没有文件则返回空字符串
     """
+    global _cache_content, _cache_valid, _cache_key
+
     if kb_path is None:
-        # 默认路径：项目根目录下的 knowledge_base
         kb_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "knowledge_base")
 
     if not os.path.isdir(kb_path):
         logger.info("知识库文件夹不存在: %s", kb_path)
+        _cache_valid = True
+        _cache_content = ""
+        _cache_key = ""
         return ""
+
+    # 计算当前缓存键，与缓存对比
+    current_key = _compute_cache_key(kb_path)
+    if _cache_valid and _cache_key == current_key:
+        logger.debug("知识库缓存命中 (%d 字符)", len(_cache_content))
+        return _cache_content
+
+    # 缓存失效或文件变化，重新加载
+    logger.info("知识库文件有变化或首次加载，重新读取")
 
     files_loaded = 0
     total_chars = 0
     sections = []
+    _cache_key = current_key
 
     # 递归遍历目录
     for root, dirs, files in os.walk(kb_path):
-        # 跳过隐藏目录
         dirs[:] = [d for d in dirs if not d.startswith(".")]
 
         for fname in sorted(files):
@@ -136,10 +182,13 @@ def load_knowledge_base(kb_path=None):
             break
 
     if not sections:
+        _cache_content = ""
+        _cache_valid = True
         logger.info("知识库为空，未加载任何文件")
         return ""
 
-    logger.info("知识库加载完成: %d 个文件, %d 字符", files_loaded, total_chars)
-
     header = "以下是从知识库中加载的参考文件内容，请根据这些资料回答用户的问题：\n"
-    return header + "\n\n".join(sections)
+    _cache_content = header + "\n\n".join(sections)
+    _cache_valid = True
+    logger.info("知识库加载完成: %d 个文件, %d 字符", files_loaded, total_chars)
+    return _cache_content

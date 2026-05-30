@@ -74,6 +74,11 @@ class AIAssistantApp:
         # ====== 注册热键 ======
         self._register_hotkeys()
 
+        # ====== 定期刷入配置（每 30 秒，防止 crash 丢数据） ======
+        self._flush_timer = QTimer()
+        self._flush_timer.timeout.connect(self.config.flush)
+        self._flush_timer.start(30000)
+
         # ====== 初始化状态 ======
         self._check_first_run()
 
@@ -100,8 +105,14 @@ class AIAssistantApp:
         painter.setFont(font)
         painter.drawText(icon_pixmap.rect(), Qt.AlignCenter, "AI")
         painter.end()
-        # 保存到临时文件
+        # 清理旧的临时图标文件
         icon_path = os.path.join(tempfile.gettempdir(), "ai_desk_icon.png")
+        if os.path.exists(icon_path):
+            try:
+                os.remove(icon_path)
+            except OSError:
+                pass
+        # 保存到临时文件
         icon_pixmap.save(icon_path, "PNG")
         app_icon = QIcon(icon_path)
         self.tray_icon.setIcon(app_icon)
@@ -495,13 +506,16 @@ class AIAssistantApp:
 
     def _quit_app(self):
         """退出程序"""
+        self._flush_timer.stop()
         self.hotkey_mgr.unregister_all()
         QApplication.instance().removeNativeEventFilter(self.hotkey_mgr)
 
+        # 保存窗口位置 / 大小并刷入磁盘
         self.config.set("chat_window.pos_x", self.chat.pos().x())
         self.config.set("chat_window.pos_y", self.chat.pos().y())
         self.config.set("chat_window.width", self.chat.width())
         self.config.set("chat_window.height", self.chat.height())
+        self.config.flush()
 
         QApplication.quit()
         logger.info("AI 桌面助手已退出")

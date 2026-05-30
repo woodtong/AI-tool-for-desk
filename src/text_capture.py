@@ -6,10 +6,13 @@
 - 自动重试机制
 """
 import time
+import logging
 import ctypes
 from ctypes import wintypes
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
+
+logger = logging.getLogger(__name__)
 
 # 常量
 INPUT_KEYBOARD = 1
@@ -200,63 +203,67 @@ def _read_clipboard_win32():
 def _try_copy():
     """
     尝试执行复制操作，使用多种方法提高成功率
-    返回 True 表示至少有一种方法执行完成
+    顺序尝试各方法，一旦检测到剪贴板有内容即返回
+
+    返回:
+        bool - 是否成功复制到内容
     """
-    # 方案 1: WM_COPY 消息（无需权限提升）
-    _send_wm_copy()
+    # 保存操作前的剪贴板内容，用于判断是否变化
+    _clear_clipboard_win32()
 
-    # 方案 2: SendInput + 扫描码（绕过部分 UIPI 限制）
-    _ctrl_c_sendinput()
+    for attempt in [
+        ("WM_COPY", _send_wm_copy, 0.03),
+        ("SendInput Ctrl+C", _ctrl_c_sendinput, 0.03),
+        ("keybd_event Ctrl+C", _ctrl_c_keyevent, 0.03),
+        ("Ctrl+Insert", _ctrl_insert_sendinput, 0.03),
+    ]:
+        name, func, wait = attempt
+        _clear_clipboard_win32()
+        func()
+        time.sleep(wait)
+        text = _read_clipboard_win32()
+        if text:
+            logger.debug("文字复制成功: 方法=%s", name)
+            return True
+        logger.debug("文字复制方法 %s 未生效，尝试下一方法", name)
 
-    # 方案 3: keybd_event 旧 API（不同权限模型）
-    _ctrl_c_keyevent()
-
-    # 方案 4: Ctrl+Insert 备选快捷键
-    _ctrl_insert_sendinput()
-
-    return True
+    return False
 
 
 def capture_selected_text(callback, delay_ms=400):
     """
     获取当前选中的文本
 
-    1. 记录当前剪贴板序列号
-    2. 清空剪贴板
-    3. 使用多种方式模拟复制
-    4. 延迟后检测序列号变化并读取文本
-    5. 若未检测到变化，重试一次
+    1. 顺序尝试多种复制方式，检测到剪贴板有内容即停止
+    2. 延迟后读取剪贴板文本
+    3. 若未检测到变化，重试一次
 
     参数:
         callback: function(str) - 获取文本后的回调
         delay_ms: int - 复制后等待剪贴板同步的延迟（毫秒）
     """
-    # 记录操作前的序列号
-    seq_before = _get_clipboard_sequence()
-    _clear_clipboard_win32()
-
-    # 执行复制操作
-    _try_copy()
+    success = _try_copy()
 
     def _read_and_check(retry=True):
-        seq_after = _get_clipboard_sequence()
-        text = ""
+        text = "" if not success else _read_clipboard_win32()
+        if not text:
+            # Qt 后备读取
+            try:
+                text = QApplication.clipboard().text() or ""
+            except Exception:
+                text = ""
 
-        if seq_after != seq_before:
-            # 剪贴板已变化，读取文本
-            text = _read_clipboard_win32()
+        if not text and retry:
+            # 首次失败，重试一次
+            if not _try_copy():
+                QTimer.singleShot(delay_ms + 100, lambda: _read_and_check(retry=False))
+                return
+            text = _read_clipboard_win32() or ""
             if not text:
                 try:
                     text = QApplication.clipboard().text() or ""
                 except Exception:
                     text = ""
-
-        if not text and retry:
-            # 首次失败，尝试再复制一次
-            _clear_clipboard_win32()
-            _try_copy()
-            QTimer.singleShot(delay_ms, lambda: _read_and_check(retry=False))
-            return
 
         try:
             callback(text)

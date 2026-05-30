@@ -16,9 +16,17 @@ class AIProviderManager:
         self._adapters = {}   # provider_id -> AIAdapter
         self._current_id = None  # 当前选中的提供者 ID
 
+    def _get_or_create_adapter(self, provider_id):
+        """按需创建单个适配器（懒加载）"""
+        if provider_id not in self._adapters:
+            provider = self._config.get_provider_by_id(provider_id)
+            if provider:
+                self._adapters[provider_id] = AIAdapter(provider)
+        return self._adapters.get(provider_id)
+
     def get_adapters(self):
         """
-        获取所有已配置的适配器（懒加载）
+        获取所有已配置的适配器（按需懒加载）
 
         返回:
             dict: {provider_id: AIAdapter}
@@ -26,26 +34,27 @@ class AIProviderManager:
         providers = self._config.get_providers()
         for p in providers:
             pid = p["id"]
-            if pid not in self._adapters:
-                self._adapters[pid] = AIAdapter(p)
+            self._get_or_create_adapter(pid)
         return self._adapters
 
     def get_current_adapter(self):
         """获取当前选中的适配器"""
-        if self._current_id and self._current_id in self._adapters:
-            return self._adapters[self._current_id]
-        # 如果没有选中，返回第一个可用的
-        adapters = self.get_adapters()
-        if adapters:
-            first = list(adapters.values())[0]
-            self._current_id = first.config.get("id")
-            return first
+        if self._current_id:
+            adapter = self._get_or_create_adapter(self._current_id)
+            if adapter:
+                return adapter
+        # 如果没有选中，取第一个可用的
+        providers = self._config.get_providers()
+        if providers:
+            first = providers[0]
+            self._current_id = first["id"]
+            return self._get_or_create_adapter(first["id"])
         return None
 
     def set_current(self, provider_id):
         """设置当前选中的提供者"""
-        adapters = self.get_adapters()
-        if provider_id in adapters:
+        adapter = self._get_or_create_adapter(provider_id)
+        if adapter:
             self._current_id = provider_id
             self._config.set("last_selected_provider", provider_id)
             return True
